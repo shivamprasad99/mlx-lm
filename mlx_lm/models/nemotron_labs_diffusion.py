@@ -1,10 +1,10 @@
 # Copyright © 2023-2024 Apple Inc.
 #
-# MLX implementation of Nemotron Labs Diffusion in autoregressive mode.
+# MLX implementation of Nemotron Labs Diffusion.
 #
-# This first pass intentionally supports the AR path only. The module names are
-# kept aligned with the checkpoint (`encoder.*` and `diffusion_head.*`) so the
-# existing MLX-LM loader can consume the local 4-bit weights directly.
+# The checkpoint uses `encoder.*` and `diffusion_head.*` module names, so this
+# file keeps that structure while supporting AR, diffusion, and self-speculative
+# generation paths.
 
 import json
 import time
@@ -40,9 +40,7 @@ class ModelArgs(BaseModelArgs):
     layer_types: Optional[List[str]] = None
     sliding_window: Optional[int] = None
 
-    # Nemotron diffusion-specific config fields. Most are unused for the first
-    # AR milestone, but parsing them keeps the config complete and prepares the
-    # class for diffusion/self-spec modes later.
+    # Nemotron diffusion-specific config fields.
     mask_token_id: int = 100
     bos_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
@@ -349,6 +347,9 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.encoder = LanguageModel(args)
         self.diffusion_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.linear_spec_lora_loaded = False
+        self.linear_spec_lora_enabled = False
+        self.linear_spec_lora_layers = 0
 
     def __call__(
         self,
@@ -359,8 +360,8 @@ class Model(nn.Module):
         update_cache: bool = True,
     ):
         # Default to causal attention so the generic MLX-LM generation stack
-        # still uses this model as a normal AR causal LM. Diffusion mode will
-        # call this with causal=False in later steps.
+        # uses this model as a normal AR causal LM. Diffusion paths call this
+        # with causal=False.
         out = self.encoder(
             inputs,
             cache=cache,
@@ -379,18 +380,10 @@ class Model(nn.Module):
         threshold: Optional[float] = None,
         seed_first_token: bool = True,
     ):
-        """Minimal one-block diffusion decode helper.
+        """Generate a single diffusion block after the prompt.
 
-        This is intentionally not a full generation API yet. It exists so we
-        can test the core diffusion mechanics in isolation:
-
-        1. causal prompt prefill into KV cache
-        2. bidirectional denoising over one mask block
-        3. no cache mutation during denoising
-
-        Returns:
-            ``(output_ids, nfe)`` where ``output_ids`` is prompt plus the
-            denoised block, and ``nfe`` is the number of denoising forwards.
+        Returns ``(output_ids, nfe)`` where ``output_ids`` is the prompt plus
+        the denoised block and ``nfe`` is the number of denoising forwards.
         """
         if prompt_ids.ndim != 2:
             raise ValueError("prompt_ids must have shape [batch, seq_len]")
@@ -410,21 +403,16 @@ class Model(nn.Module):
         )
         mx.eval(prompt_logits)
 
-        block = mx.full(
-            (batch_size, block_length), mask_token_id, dtype=prompt_ids.dtype
-        )
+        seed_token = None
         if seed_first_token:
-            next_token = mx.argmax(prompt_logits[:, -1, :], axis=-1)[:, None]
-            if block_length == 1:
-                block = next_token.astype(prompt_ids.dtype)
-            else:
-                block = mx.concatenate(
-                    [
-                        next_token.astype(prompt_ids.dtype),
-                        block[:, 1:],
-                    ],
-                    axis=1,
-                )
+            seed_token = mx.argmax(prompt_logits[:, -1, :], axis=-1)[:, None]
+        block = _make_diffusion_block(
+            batch_size,
+            block_length,
+            mask_token_id,
+            prompt_ids.dtype,
+            seed_token,
+        )
 
         initial_mask = block == mask_token_id
         num_transfer_tokens = _get_num_transfer_tokens(initial_mask, steps)
@@ -468,13 +456,9 @@ class Model(nn.Module):
         eos_token_id: Optional[int] = None,
         seed_first_token: bool = True,
     ):
-        """Minimal multi-block diffusion generation.
+        """Generate tokens with block diffusion decoding.
 
-        This is the first complete diffusion decoding loop. It intentionally
-        stays as a model method for testing before CLI integration.
-
-        Returns:
-            ``(output_ids, nfe)`` where ``output_ids`` includes the prompt.
+        Returns ``(output_ids, nfe)`` where ``output_ids`` includes the prompt.
         """
         if prompt_ids.ndim != 2:
             raise ValueError("prompt_ids must have shape [batch, seq_len]")
@@ -512,16 +496,13 @@ class Model(nn.Module):
         nfe = 0
 
         for _ in range(num_blocks):
-            block = mx.full(
-                (batch_size, block_length), mask_token_id, dtype=prompt_ids.dtype
+            block = _make_diffusion_block(
+                batch_size,
+                block_length,
+                mask_token_id,
+                prompt_ids.dtype,
+                next_token if seed_first_token else None,
             )
-            if seed_first_token and next_token is not None:
-                if block_length == 1:
-                    block = next_token.astype(prompt_ids.dtype)
-                else:
-                    block = mx.concatenate(
-                        [next_token.astype(prompt_ids.dtype), block[:, 1:]], axis=1
-                    )
 
             initial_mask = block == mask_token_id
             num_transfer_tokens = _get_num_transfer_tokens(
@@ -600,21 +581,24 @@ class Model(nn.Module):
         draft_steps: int = 1,
         profile: bool = False,
     ):
-        """Minimal self-speculative decoding.
+        """Generate tokens with Nemotron's diffusion/AR self-speculation.
 
-        Diffusion drafts a block, AR verifies it, then we accept the longest
-        matching prefix plus one AR bonus token. When ``use_adapter=True``, the
-        linear-speculation LoRA is enabled only for diffusion drafting and is
-        disabled for AR prefill/verification.
+        Diffusion drafts a block, AR verifies it, then the longest matching
+        prefix plus one AR bonus token is accepted. When ``use_adapter=True``,
+        the linear-speculation LoRA is enabled only for diffusion drafting.
         """
         if prompt_ids.ndim != 2:
             raise ValueError("prompt_ids must have shape [batch, seq_len]")
         if prompt_ids.shape[0] != 1:
             raise ValueError("self_spec_generate currently requires batch size 1")
         if temperature != 0.0:
-            raise NotImplementedError("self_spec_generate currently supports greedy decoding only")
+            raise NotImplementedError(
+                "self_spec_generate currently supports greedy decoding only"
+            )
         if threshold != 0.0:
-            raise NotImplementedError("thresholded self-spec draft is not implemented yet")
+            raise NotImplementedError(
+                "thresholded self-spec draft is not implemented yet"
+            )
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
         if draft_steps <= 0:
@@ -627,11 +611,11 @@ class Model(nn.Module):
         block_length = block_length or self.args.block_size
         mask_token_id = self.args.mask_token_id
 
-        if use_adapter and not getattr(self, "linear_spec_lora_loaded", False):
+        if use_adapter and not self.linear_spec_lora_loaded:
             raise RuntimeError(
                 "use_adapter=True requires load_linear_spec_lora(...) first."
             )
-        if getattr(self, "linear_spec_lora_loaded", False):
+        if self.linear_spec_lora_loaded:
             self.set_linear_spec_lora_enabled(False)
 
         cache = self.make_cache()
@@ -676,17 +660,16 @@ class Model(nn.Module):
             cache_len = cache[0].offset
             remaining = max_new_tokens - total_generated
 
-            block = mx.full((1, block_length), mask_token_id, dtype=prompt_ids.dtype)
-            if block_length == 1:
-                block = next_token.astype(prompt_ids.dtype)
-            else:
-                block = mx.concatenate(
-                    [next_token.astype(prompt_ids.dtype), block[:, 1:]], axis=1
-                )
+            block = _make_diffusion_block(
+                1,
+                block_length,
+                mask_token_id,
+                prompt_ids.dtype,
+                next_token,
+            )
 
             # Diffusion draft phase. The optional LoRA adapter is enabled only
-            # for this draft phase. With draft_steps=1 this is the previous
-            # one-shot fill. With draft_steps>1, the block is progressively
+            # while drafting. With draft_steps>1, the block is progressively
             # filled over multiple diffusion forwards.
             initial_mask = block == mask_token_id
             num_transfer_tokens = _get_num_transfer_tokens(initial_mask, draft_steps)
@@ -937,8 +920,24 @@ class Model(nn.Module):
         ]
 
 
-# Diffusion/self-speculation helpers. These are intentionally small,
-# module-level utilities so we can test mechanics before adding larger loops.
+# Diffusion/self-speculation helpers.
+def _make_diffusion_block(
+    batch_size: int,
+    block_length: int,
+    mask_token_id: int,
+    dtype,
+    seed_token: Optional[mx.array] = None,
+) -> mx.array:
+    """Create a masked diffusion block, optionally seeding position 0."""
+    if seed_token is not None and block_length == 1:
+        return seed_token.astype(dtype)
+
+    block = mx.full((batch_size, block_length), mask_token_id, dtype=dtype)
+    if seed_token is None:
+        return block
+    return mx.concatenate([seed_token.astype(dtype), block[:, 1:]], axis=1)
+
+
 def _crop_cache(cache, max_length: int):
     """Crop every layer cache to an absolute sequence length.
 
@@ -1002,8 +1001,6 @@ def _get_transfer_index(
     x0 = mx.where(mask_index, x0, x)
     confidence = mx.where(mask_index, x0_probs, -mx.inf)
 
-    # Keep this first version simple and easy to inspect. Diffusion generation
-    # is normally batch size 1 in our local testing path.
     mx.eval(confidence, num_transfer_tokens)
     transfer_rows = []
     for batch_idx in range(confidence.shape[0]):
