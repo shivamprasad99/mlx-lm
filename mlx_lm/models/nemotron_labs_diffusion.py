@@ -569,6 +569,215 @@ class Model(nn.Module):
         generated = mx.concatenate(generated_blocks, axis=1)
         return mx.concatenate([prompt_ids, generated], axis=1), nfe
 
+    def self_spec_stream_generate(
+        self,
+        prompt_ids: mx.array,
+        max_new_tokens: int = 128,
+        block_length: Optional[int] = None,
+        temperature: float = 0.0,
+        threshold: float = 0.0,
+        eos_token_id: Optional[int] = None,
+        use_adapter: bool = False,
+        draft_steps: int = 1,
+        profile: bool = False,
+    ):
+        """Stream tokens from diffusion/AR self-speculation.
+
+        Yields ``(token_ids, stats)`` after the initial AR seed token and after
+        each accepted self-speculation chunk. ``token_ids`` has shape
+        ``[1, chunk_length]``.
+        """
+        if prompt_ids.ndim != 2:
+            raise ValueError("prompt_ids must have shape [batch, seq_len]")
+        if prompt_ids.shape[0] != 1:
+            raise ValueError("self_spec_stream_generate currently requires batch size 1")
+        if temperature != 0.0:
+            raise NotImplementedError(
+                "self_spec_stream_generate currently supports greedy decoding only"
+            )
+        if threshold != 0.0:
+            raise NotImplementedError(
+                "thresholded self-spec draft is not implemented yet"
+            )
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if draft_steps <= 0:
+            raise ValueError("draft_steps must be positive")
+
+        total_start = time.perf_counter() if profile else None
+
+        if eos_token_id is None:
+            eos_token_id = self.args.eos_token_id
+        block_length = block_length or self.args.block_size
+        mask_token_id = self.args.mask_token_id
+
+        if use_adapter and not self.linear_spec_lora_loaded:
+            raise RuntimeError(
+                "use_adapter=True requires load_linear_spec_lora(...) first."
+            )
+        if self.linear_spec_lora_loaded:
+            self.set_linear_spec_lora_enabled(False)
+
+        def snapshot_stats():
+            if profile:
+                stats["total_time"] = time.perf_counter() - total_start
+            snap = stats.copy()
+            for key in (
+                "accepted_per_iter",
+                "cache_len_per_iter",
+                "unresolved_masks_per_iter",
+            ):
+                if key in snap:
+                    snap[key] = list(snap[key])
+            return snap
+
+        cache = self.make_cache()
+        prefill_start = time.perf_counter() if profile else None
+        output = self(prompt_ids, cache=cache, causal=True, update_cache=True)
+        mx.eval(output)
+        prefill_time = time.perf_counter() - prefill_start if profile else 0.0
+
+        next_token = mx.argmax(output[:, -1, :], axis=-1)[:, None]
+        next_token = next_token.astype(prompt_ids.dtype)
+        mx.eval(next_token)
+
+        stats = {
+            "nfe": 1,
+            "draft_forwards": 0,
+            "verify_forwards": 0,
+            "accepted_tokens": 0,
+            "drafted_tokens": 0,
+            "acceptance_rate": 0.0,
+        }
+        if profile:
+            stats.update(
+                {
+                    "prefill_time": prefill_time,
+                    "draft_time": 0.0,
+                    "verify_time": 0.0,
+                    "accept_time": 0.0,
+                    "crop_time": 0.0,
+                    "total_time": 0.0,
+                    "accepted_per_iter": [],
+                    "cache_len_per_iter": [],
+                    "unresolved_masks_per_iter": [],
+                }
+            )
+
+        try:
+            yield next_token, snapshot_stats()
+            if eos_token_id is not None and int(next_token.item()) == eos_token_id:
+                return
+
+            total_generated = 1
+            while total_generated < max_new_tokens:
+                cache_len = cache[0].offset
+                remaining = max_new_tokens - total_generated
+
+                block = _make_diffusion_block(
+                    1,
+                    block_length,
+                    mask_token_id,
+                    prompt_ids.dtype,
+                    next_token,
+                )
+
+                initial_mask = block == mask_token_id
+                num_transfer_tokens = _get_num_transfer_tokens(
+                    initial_mask, draft_steps
+                )
+                stats["drafted_tokens"] += block_length
+
+                for draft_step_idx in range(draft_steps):
+                    mask_index = block == mask_token_id
+                    mx.eval(mask_index)
+                    if not bool(mx.any(mask_index).item()):
+                        break
+
+                    if use_adapter:
+                        self.set_linear_spec_lora_enabled(True)
+                    draft_start = time.perf_counter() if profile else None
+                    try:
+                        logits = self(
+                            block, cache=cache, causal=False, update_cache=False
+                        )
+                        mx.eval(logits)
+                    finally:
+                        if use_adapter:
+                            self.set_linear_spec_lora_enabled(False)
+                    if profile:
+                        stats["draft_time"] += time.perf_counter() - draft_start
+
+                    stats["nfe"] += 1
+                    stats["draft_forwards"] += 1
+
+                    x0, transfer_index = _get_transfer_index(
+                        logits,
+                        temperature,
+                        mask_index,
+                        block,
+                        num_transfer_tokens[:, draft_step_idx],
+                        threshold=None,
+                    )
+                    block = mx.where(transfer_index, x0.astype(block.dtype), block)
+                    mx.eval(block)
+
+                if profile:
+                    unresolved_masks = int(mx.sum(block == mask_token_id).item())
+                    stats["unresolved_masks_per_iter"].append(unresolved_masks)
+
+                verify_start = time.perf_counter() if profile else None
+                verify_logits = self(block, cache=cache, causal=True, update_cache=True)
+                ar_tokens = mx.argmax(verify_logits, axis=-1).astype(block.dtype)
+                mx.eval(ar_tokens, block)
+                if profile:
+                    stats["verify_time"] += time.perf_counter() - verify_start
+                stats["nfe"] += 1
+                stats["verify_forwards"] += 1
+
+                accept_start = time.perf_counter() if profile else None
+                block_list = block.tolist()[0]
+                ar_list = ar_tokens.tolist()[0]
+
+                accepted = 0
+                for i in range(block_length - 1):
+                    if ar_list[i] == block_list[i + 1]:
+                        accepted += 1
+                    else:
+                        break
+                accepted += 1
+                accepted = min(accepted, remaining)
+
+                accepted_toks = ar_tokens[:, :accepted]
+                total_generated += accepted
+                stats["accepted_tokens"] += accepted
+                stats["acceptance_rate"] = stats["accepted_tokens"] / max(
+                    1, stats["drafted_tokens"]
+                )
+                if profile:
+                    stats["accepted_per_iter"].append(accepted)
+                    stats["cache_len_per_iter"].append(cache_len)
+                    stats["accept_time"] += time.perf_counter() - accept_start
+
+                crop_start = time.perf_counter() if profile else None
+                _crop_cache(cache, cache_len + accepted)
+                next_token = ar_tokens[:, accepted - 1 : accepted]
+                mx.eval(next_token)
+                if profile:
+                    stats["crop_time"] += time.perf_counter() - crop_start
+
+                if eos_token_id is not None:
+                    accepted_list = accepted_toks.tolist()[0]
+                    if eos_token_id in accepted_list:
+                        stop_len = accepted_list.index(eos_token_id) + 1
+                        yield accepted_toks[:, :stop_len], snapshot_stats()
+                        return
+
+                yield accepted_toks, snapshot_stats()
+        finally:
+            if use_adapter and self.linear_spec_lora_loaded:
+                self.set_linear_spec_lora_enabled(False)
+
     def self_spec_generate(
         self,
         prompt_ids: mx.array,
